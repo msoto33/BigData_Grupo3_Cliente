@@ -1,0 +1,23 @@
+
+# Archivos de datos
+*.csv
+
+# Archivos temporales de Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.tmp
+*.temp
+*.log
+*~
+
+# Entorno virtual
+.venv/
+venv/
+env/
+ENV/
+
+# Configuración local
+.env
+.env.*
+!.env.example
