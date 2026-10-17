@@ -3,41 +3,37 @@
 import argparse
 import socket
 
-from transmision import TIMEOUT, VERSION, codificar, recibir, validar_destino
+import json
+
+from transmision import TIMEOUT, PUERTO, MARCA_FIN, validar_destino
+
+MAX_BYTES = 512 * 1024 * 1024
 
 
 def procesar_conexion(conexion: socket.socket) -> int:
-    """Validar la secuencia JSON Lines y confirmar solo un envío completo."""
+    """Receptor local del contrato Grupo 4; sin persistencia ni dashboard."""
     conexion.settimeout(TIMEOUT)
-    with conexion.makefile("rb") as archivo:
-        inicio = recibir(archivo)
-        if inicio == {"tipo": "ping", "version": VERSION}:
-            conexion.sendall(codificar({"tipo": "pong", "version": VERSION}))
-            return 0
-        columnas = inicio.get("columnas")
-        total = inicio.get("registros")
-        if (inicio.get("tipo") != "inicio" or inicio.get("version") != VERSION or
-                not isinstance(columnas, list) or not columnas or
-                not all(isinstance(c, str) for c in columnas) or
-                len(set(columnas)) != len(columnas) or type(total) is not int or total < 0):
-            raise ValueError("Cabecera de inicio inválida.")
-        recibidos = 0
-        while True:
-            mensaje = recibir(archivo)
-            if mensaje.get("tipo") == "fin":
-                if type(mensaje.get("registros")) is not int or mensaje["registros"] != recibidos or recibidos != total:
-                    raise ValueError(f"Conteos inconsistentes: esperados={total}, recibidos={recibidos}.")
-                conexion.sendall(codificar({"tipo": "confirmacion", "registros": recibidos}))
-                return recibidos
-            valores = mensaje.get("datos")
-            if (mensaje.get("tipo") != "registro" or not isinstance(valores, list) or
-                    len(valores) != len(columnas) or recibidos >= total or
-                    any(isinstance(v, (list, dict)) for v in valores)):
-                raise ValueError("Registro inválido o mensaje fuera de secuencia.")
-            recibidos += 1
+    datos = bytearray()
+    while True:
+        bloque = conexion.recv(1024 * 1024)
+        if not bloque:
+            break
+        datos.extend(bloque)
+        if len(datos) > MAX_BYTES:
+            raise ValueError("Transferencia superior a 512 MiB.")
+    if not datos.endswith(MARCA_FIN):
+        raise ValueError("Falta el sufijo <EOF>.")
+    del datos[-len(MARCA_FIN):]
+    def rechazar(valor):
+        raise ValueError(f"Constante JSON inv?lida: {valor}")
+    registros = json.loads(datos.decode("utf-8"), parse_constant=rechazar)
+    if not isinstance(registros, list) or not all(isinstance(r, dict) for r in registros):
+        raise ValueError("Se requiere un arreglo JSON de objetos.")
+    conexion.sendall(json.dumps({"ok": True, "filas": len(registros)}).encode("utf-8"))
+    return len(registros)
 
 
-def servir(host: str = "127.0.0.1", puerto: int = 5000) -> None:
+def servir(host: str = "127.0.0.1", puerto: int = PUERTO) -> None:
     """Atender conexiones sucesivas hasta Ctrl+C, sin persistir datos."""
     validar_destino(host, puerto)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as servidor:
@@ -54,7 +50,7 @@ def servir(host: str = "127.0.0.1", puerto: int = 5000) -> None:
                 except (OSError, ValueError, ConnectionError, UnicodeError) as error:
                     print(f"{direccion}: error: {error}", flush=True)
                     try:
-                        conexion.sendall(codificar({"tipo": "error", "mensaje": str(error)[:1000]}))
+                        conexion.sendall(json.dumps({"ok": False, "filas": 0, "detalle": str(error)[:1000]}).encode("utf-8"))
                     except OSError:
                         pass
 
@@ -62,7 +58,7 @@ def servir(host: str = "127.0.0.1", puerto: int = 5000) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--puerto", type=int, default=5000)
+    parser.add_argument("--puerto", type=int, default=PUERTO)
     opciones = parser.parse_args()
     try:
         servir(opciones.host, opciones.puerto)

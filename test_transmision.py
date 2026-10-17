@@ -1,7 +1,10 @@
 """Pruebas TCP locales, sin GUI ni persistencia de registros recibidos."""
 
 import hashlib
-import io
+import json
+import time
+import importlib.util
+from pathlib import Path
 import socket
 from queue import Queue
 from threading import Thread
@@ -12,7 +15,7 @@ import pandas as pd
 
 from cliente import RUTA_DATASET, leer_dataset
 from servidor_prueba import procesar_conexion
-from transmision import (ErrorTransmision, MAX_LINEA, codificar, enviar_datos,
+from transmision import (ErrorTransmision, MAX_RESPUESTA, enviar_datos,
                          probar_conexion, recibir, ResultadoEnvio)
 from interfaz_cliente import InterfazCliente
 
@@ -48,98 +51,89 @@ class ServidorUnaConexion:
 
 
 class PruebasTCP(unittest.TestCase):
-    def test_01_muestra_y_dataset_completo(self):
+    def test_dataset_y_muestra_con_servidor_grupo4(self):
+        ruta = Path(r"C:\Users\msoto\Desktop\bigdata_evaluacion2\servidor_prueba.py")
+        if not ruta.is_file():
+            self.skipTest("Servidor de referencia Grupo 4 no disponible")
+        spec = importlib.util.spec_from_file_location("grupo4_referencia", ruta)
+        modulo = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(modulo)
         huella = hashlib.sha256(RUTA_DATASET.read_bytes()).hexdigest()
         datos = leer_dataset(RUTA_DATASET)
-        for cantidad in (50, 569_250):
-            with self.subTest(registros=cantidad):
-                servidor = ServidorUnaConexion()
-                progreso = []
-                resultado = enviar_datos(datos.head(cantidad), "127.0.0.1", servidor.puerto,
-                                         lambda enviados, total: progreso.append(enviados))
-                servidor.esperar()
-                self.assertIsNone(servidor.error)
-                self.assertEqual((resultado.enviados, resultado.confirmados, servidor.resultado),
-                                 (cantidad, cantidad, cantidad))
-                self.assertEqual(progreso[-1], cantidad)
-                print(f"\nTCP: enviados={resultado.enviados}, confirmados={resultado.confirmados}, recibidos={servidor.resultado}", flush=True)
+        for cantidad in (50, len(datos)):
+            def atender(conexion):
+                return modulo.atender(conexion, registrar=lambda mensaje: None)
+            servidor = ServidorUnaConexion(atender)
+            progreso = []
+            resultado = enviar_datos(datos.head(cantidad), "127.0.0.1", servidor.puerto,
+                                     lambda n, total: progreso.append(n))
+            servidor.esperar()
+            self.assertIsNone(servidor.error)
+            self.assertEqual(resultado, ResultadoEnvio(cantidad, cantidad))
+            self.assertEqual(servidor.resultado["filas"], cantidad)
+            self.assertEqual(progreso[-1], cantidad)
+            print(f"TCP Grupo 4: {cantidad} filas confirmadas", flush=True)
         self.assertEqual(hashlib.sha256(RUTA_DATASET.read_bytes()).hexdigest(), huella)
 
-    def test_02_fragmentos_utf8_y_controles(self):
-        servidor = ServidorUnaConexion()
-        mensajes = [
-            {"tipo": "inicio", "version": 1, "columnas": ["tipo"], "registros": 1},
-            {"tipo": "registro", "datos": ["fin: río Ñuble\nsegunda línea"]},
-            {"tipo": "fin", "registros": 1},
-        ]
-        with socket.create_connection(("127.0.0.1", servidor.puerto), timeout=5) as conexion:
-            for mensaje in mensajes:
-                for byte in codificar(mensaje):
-                    conexion.sendall(bytes([byte]))
-            with conexion.makefile("rb") as archivo:
-                self.assertEqual(recibir(archivo), {"tipo": "confirmacion", "registros": 1})
+    def test_seleccion_nulos_unicode_y_lotes(self):
+        def inspeccionar(conexion):
+            datos = bytearray()
+            while bloque := conexion.recv(17):
+                datos.extend(bloque)
+            self.assertTrue(datos.endswith(b"]<EOF>"))
+            registros = json.loads(datos[:-5])
+            self.assertEqual(registros, [{"caudal": None, "texto": "r?o <EOF>\n?uble"}] * 3000)
+            for byte in b'{"ok":true,"filas":3000}':
+                conexion.sendall(bytes([byte]))
+        servidor = ServidorUnaConexion(inspeccionar)
+        datos = pd.DataFrame({"caudal": [float("nan")] * 3000, "texto": ["r?o <EOF>\n?uble"] * 3000})
+        progreso = []
+        enviar_datos(datos, "127.0.0.1", servidor.puerto, lambda n, total: progreso.append(n))
         servidor.esperar()
         self.assertIsNone(servidor.error)
-        self.assertEqual(servidor.resultado, 1)
+        self.assertGreater(len(progreso), 1)
 
-    def test_03_seleccion_nulos_y_ping(self):
-        servidor = ServidorUnaConexion()
+    def test_prueba_tcp_no_envia_bytes(self):
+        servidor = ServidorUnaConexion(lambda conexion: conexion.recv(100))
         probar_conexion("127.0.0.1", servidor.puerto)
         servidor.esperar()
-        self.assertIsNone(servidor.error)
-        def inspeccionar(conexion):
-            with conexion.makefile("rb") as archivo:
-                self.assertEqual(recibir(archivo)["columnas"], ["caudal"])
-                self.assertEqual(recibir(archivo)["datos"], [None])
-                self.assertEqual(recibir(archivo)["tipo"], "fin")
-                conexion.sendall(codificar({"tipo": "confirmacion", "registros": 1}))
-        datos = pd.DataFrame({"fecha": ["2015"], "caudal": [float("nan")]})
-        servidor = ServidorUnaConexion(inspeccionar)
-        enviar_datos(datos.loc[:, ["caudal"]], "127.0.0.1", servidor.puerto)
-        servidor.esperar()
-        self.assertIsNone(servidor.error)
+        self.assertEqual(servidor.resultado, b"")
 
-    def test_04_confirmacion_incorrecta_y_desconexion(self):
-        def respuesta_incorrecta(conexion):
-            with conexion.makefile("rb") as archivo:
-                while recibir(archivo)["tipo"] != "fin":
-                    pass
-                conexion.sendall(codificar({"tipo": "confirmacion", "registros": 999}))
-        for manejador in (respuesta_incorrecta, lambda conexion: None):
-            servidor = ServidorUnaConexion(manejador)
-            with self.assertRaises(ErrorTransmision) as contexto:
-                enviar_datos(pd.DataFrame({"a": [1]}), "127.0.0.1", servidor.puerto)
-            self.assertEqual(contexto.exception.confirmados, 0)
-            servidor.esperar()
+    def test_confirmaciones_invalidas(self):
+        respuestas = [b'', b'{}', b'{"ok":false,"filas":0,"detalle":"ocupado"}',
+                      b'{"ok":true,"filas":999}', b'{"ok":true,"filas":true}',
+                      b'{"ok":1,"filas":1}', b'[]', b'NaN', b'{}x', b'\xff', b'x' * (MAX_RESPUESTA + 1)]
+        for respuesta in respuestas:
+            with self.subTest(respuesta=respuesta[:100]):
+                def atender(conexion):
+                    while conexion.recv(4096):
+                        pass
+                    conexion.sendall(respuesta)
+                servidor = ServidorUnaConexion(atender)
+                with self.assertRaises(ErrorTransmision) as error:
+                    enviar_datos(pd.DataFrame({"a": [1]}), "127.0.0.1", servidor.puerto)
+                self.assertEqual(error.exception.confirmados, 0)
+                self.assertEqual(error.exception.enviados, 1)
+                servidor.esperar()
 
-    def test_05_limites_y_seleccion_vacia(self):
-        for contenido in (b'{"tipo":"fin"}', b'x' * (MAX_LINEA + 1), b'NaN\n', b'{}\xff\n'):
-            with self.assertRaises((ValueError, UnicodeError)):
-                recibir(io.BytesIO(contenido))
-        with self.assertRaises(ValueError):
-            codificar({"datos": "x" * MAX_LINEA})
+    def test_timeout_y_seleccion_invalida(self):
+        def esperar(conexion):
+            while conexion.recv(4096):
+                pass
+            time.sleep(0.3)
+        servidor = ServidorUnaConexion(esperar)
         with self.assertRaises(ErrorTransmision):
-            enviar_datos(pd.DataFrame(index=range(3)), "127.0.0.1", 5000)
+            enviar_datos(pd.DataFrame({"a": [1]}), "127.0.0.1", servidor.puerto, timeout=0.05)
+        servidor.esperar()
+        for datos in (pd.DataFrame(index=range(3)), pd.DataFrame([[1, 2]], columns=["a", "a"])):
+            with self.assertRaises(ErrorTransmision):
+                enviar_datos(datos, "127.0.0.1", 12345)
 
-    def test_06_conteo_incorrecto_y_timeout(self):
+    def test_receptor_local(self):
         servidor = ServidorUnaConexion()
-        with socket.create_connection(("127.0.0.1", servidor.puerto), timeout=5) as conexion:
-            conexion.sendall(codificar({"tipo": "inicio", "version": 1, "columnas": ["a"], "registros": 1})
-                               + codificar({"tipo": "fin", "registros": 0}))
+        self.assertEqual(enviar_datos(pd.DataFrame({"a": [1]}), "127.0.0.1", servidor.puerto), ResultadoEnvio(1, 1))
         servidor.esperar()
-        self.assertIsInstance(servidor.error, ValueError)
-        def no_confirmar(conexion):
-            with conexion.makefile("rb") as archivo:
-                while recibir(archivo)["tipo"] != "fin":
-                    pass
-                conexion.settimeout(3)
-                conexion.recv(1)
-        servidor = ServidorUnaConexion(no_confirmar)
-        with self.assertRaises(ErrorTransmision) as contexto:
-            enviar_datos(pd.DataFrame({"a": [1]}), "127.0.0.1", servidor.puerto, timeout=0.2)
-        self.assertEqual(contexto.exception.enviados, 1)
-        self.assertEqual(contexto.exception.confirmados, 0)
-        servidor.esperar()
+        self.assertIsNone(servidor.error)
 
 
 class PruebasIntegracionInterfaz(unittest.TestCase):
@@ -156,7 +150,7 @@ class PruebasIntegracionInterfaz(unittest.TestCase):
         for nombre in ("boton", "boton_enviar", "boton_probar", "estado", "progreso_red", "host", "puerto"):
             setattr(app, nombre, Mock())
         app.host.get.return_value = "127.0.0.1"
-        app.puerto.get.return_value = "5000"
+        app.puerto.get.return_value = "12345"
         app.barra_progreso = {}
         app.eventos_red = Queue()
         def enviar(copia, host, puerto, progreso):

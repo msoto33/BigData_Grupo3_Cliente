@@ -10,7 +10,7 @@ from tkinter import filedialog, ttk
 import pandas as pd
 
 from cliente import RUTA_DATASET, leer_dataset
-from transmision import ErrorTransmision, enviar_datos, probar_conexion, validar_destino
+from transmision import PUERTO, ErrorTransmision, enviar_datos, probar_conexion, validar_destino
 
 
 COLUMNAS_CAMELS = (
@@ -102,7 +102,7 @@ class InterfazCliente:
         red = ttk.LabelFrame(contenido, text="Servidor TCP (protocolo provisional)", padding=8)
         red.grid(row=6, column=0, sticky="ew", pady=6)
         self.host = tk.StringVar(value="127.0.0.1")
-        self.puerto = tk.StringVar(value="5000")
+        self.puerto = tk.StringVar(value=str(PUERTO))
         ttk.Label(red, text="IP/host:").grid(row=0, column=0)
         ttk.Entry(red, textvariable=self.host, width=20).grid(row=0, column=1, padx=6)
         ttk.Label(red, text="Puerto:").grid(row=0, column=2)

@@ -1,4 +1,4 @@
-"""Cliente TCP y codificación del protocolo provisional CAMELS-CL v1."""
+"""Cliente TCP y codificación del protocolo de ingesta del Grupo 4."""
 
 import json
 import math
@@ -8,34 +8,31 @@ from typing import Callable
 
 import pandas as pd
 
-VERSION = 1
-TIMEOUT = 30
-MAX_LINEA = 1_048_576  # Bytes, incluido el salto de línea.
+PUERTO = 12345
+TIMEOUT = 120
+MAX_RESPUESTA = 65_536
 TAMANO_LOTE = 65_536
+MARCA_FIN = b"<EOF>"
 
 
-def codificar(mensaje: dict) -> bytes:
-    """Codificar una única línea JSON estricta, con un límite explícito."""
-    linea = (json.dumps(mensaje, ensure_ascii=False, allow_nan=False,
-                        separators=(",", ":")) + "\n").encode("utf-8")
-    if len(linea) > MAX_LINEA:
-        raise ValueError("Mensaje superior al límite de 1 MiB.")
-    return linea
-
-
-def recibir(archivo) -> dict:
-    """Leer una línea completa; el búfer recompone fragmentos TCP."""
-    linea = archivo.readline(MAX_LINEA + 1)
-    if not linea:
-        raise ConnectionError("Desconexión antes de completar el protocolo.")
-    if len(linea) > MAX_LINEA or not linea.endswith(b"\n"):
-        raise ValueError("Línea incompleta o superior al límite de 1 MiB.")
+def recibir(conexion) -> dict:
+    """Recomponer la confirmaci?n UTF-8 hasta el cierre remoto, con l?mite."""
+    datos = bytearray()
+    while True:
+        bloque = conexion.recv(min(4096, MAX_RESPUESTA + 1 - len(datos)))
+        if not bloque:
+            break
+        datos.extend(bloque)
+        if len(datos) > MAX_RESPUESTA:
+            raise ValueError("Confirmaci?n superior al l?mite de 64 KiB.")
+    if not datos:
+        raise ConnectionError("El servidor cerr? sin confirmar la transferencia.")
     def rechazar_constante(valor):
-        raise ValueError(f"Constante JSON no válida: {valor}")
-    mensaje = json.loads(linea.decode("utf-8"), parse_constant=rechazar_constante)
-    if not isinstance(mensaje, dict):
-        raise ValueError("Cada mensaje debe ser un objeto JSON.")
-    return mensaje
+        raise ValueError(f"Constante JSON no v?lida: {valor}")
+    respuesta = json.loads(datos.decode("utf-8"), parse_constant=rechazar_constante)
+    if not isinstance(respuesta, dict):
+        raise ValueError("La confirmaci?n debe ser un objeto JSON.")
+    return respuesta
 
 
 def validar_destino(host: str, puerto: int) -> None:
@@ -45,14 +42,10 @@ def validar_destino(host: str, puerto: int) -> None:
 
 
 def probar_conexion(host: str, puerto: int, timeout: float = TIMEOUT) -> None:
-    """Comprobar TCP y compatibilidad del protocolo mediante ping/pong."""
+    """Comprobar solo acceso TCP, sin ping ni transferencia vac?a."""
     validar_destino(host, puerto)
-    with socket.create_connection((host, puerto), timeout=timeout) as conexion:
-        conexion.sendall(codificar({"tipo": "ping", "version": VERSION}))
-        with conexion.makefile("rb") as archivo:
-            respuesta = recibir(archivo)
-        if respuesta != {"tipo": "pong", "version": VERSION}:
-            raise ValueError("El servidor no confirmó el protocolo provisional.")
+    with socket.create_connection((host, puerto), timeout=timeout):
+        pass
 
 
 @dataclass(frozen=True)
@@ -97,12 +90,14 @@ def enviar_datos(datos: pd.DataFrame, host: str, puerto: int,
             raise ValueError("Se requiere al menos una columna con nombre único de texto.")
         total = len(datos)
         with socket.create_connection((host, puerto), timeout=timeout) as conexion:
-            conexion.sendall(codificar({"tipo": "inicio", "version": VERSION,
-                                       "columnas": columnas, "registros": total}))
+            conexion.sendall(b"[")
             lote = bytearray()
             pendientes = 0
             for fila in datos.itertuples(index=False, name=None):
-                linea = codificar({"tipo": "registro", "datos": [valor_json(v) for v in fila]})
+                registro = dict(zip(columnas, (valor_json(v) for v in fila)))
+                linea = (("," if enviados + pendientes else "") + json.dumps(
+                    registro, ensure_ascii=False, allow_nan=False,
+                    separators=(",", ":"))).encode("utf-8")
                 if lote and len(lote) + len(linea) > TAMANO_LOTE:
                     conexion.sendall(lote)
                     enviados += pendientes
@@ -117,13 +112,13 @@ def enviar_datos(datos: pd.DataFrame, host: str, puerto: int,
                 enviados += pendientes
                 if progreso:
                     progreso(enviados, total)
-            conexion.sendall(codificar({"tipo": "fin", "registros": enviados}))
-            with conexion.makefile("rb") as archivo:
-                respuesta = recibir(archivo)
-            if (respuesta.get("tipo") != "confirmacion" or
-                    type(respuesta.get("registros")) is not int or
-                    respuesta["registros"] != total):
-                raise ValueError(f"Confirmación inválida del servidor: {respuesta}")
+            conexion.sendall(b"]" + MARCA_FIN)
+            conexion.shutdown(socket.SHUT_WR)
+            respuesta = recibir(conexion)
+            if respuesta.get("ok") is not True:
+                raise ValueError(f"El servidor rechaz? el env?o: {respuesta.get('detalle', respuesta)}")
+            if type(respuesta.get("filas")) is not int or respuesta["filas"] != total:
+                raise ValueError(f"Confirmaci?n inv?lida del servidor: {respuesta}")
         return ResultadoEnvio(enviados, total)
     except Exception as error:
         raise ErrorTransmision(str(error), enviados) from error

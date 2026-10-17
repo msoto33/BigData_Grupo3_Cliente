@@ -11,7 +11,7 @@ No modifica el archivo original ni guarda los datos recibidos en el servidor.
 | 1. Lectura y validación | Detección de formato, dimensiones, tipos, muestra, nulos, duplicados y mínimo de 500.000 registros. | `cliente.py` |
 | 2. Interfaz gráfica | Selección del CSV, resumen, tabla de hasta 100 filas y lectura en segundo plano. | `interfaz_cliente.py` |
 | 3. Selección de columnas | Casillas dinámicas, selección total o vacía, contador y conservación del DataFrame completo. | `interfaz_cliente.py` |
-| 4. Comunicación TCP local | JSON Lines, envío progresivo, progreso, confirmación y servidor de pruebas independiente del Grupo 4. | `transmision.py`, `servidor_prueba.py` |
+| 4. Comunicación TCP local | Protocolo Grupo 4, lotes, progreso y confirmación JSON. | `transmision.py`, `servidor_prueba.py` |
 
 Requiere Python 3.10 o posterior con Tcl/Tk y la dependencia `pandas` declarada
 en `requirements.txt`. Tkinter, sockets, JSON y las pruebas usan la biblioteca
@@ -62,119 +62,84 @@ Seleccionar columnas no modifica el DataFrame original ni el CSV. Al elegir otro
 archivo se limpia la selección anterior y, tras una carga correcta, se seleccionan
 todas las columnas del nuevo dataset.
 
-## Comunicación TCP local (Etapa 4)
+## TCP compatible con Grupo 4
 
-En una terminal de VS Code, iniciar el servidor:
-
-```powershell
-python servidor_prueba.py
-```
-
-En otra terminal, abrir la aplicación:
+Inicie el servidor oficial y pulse **Iniciar escucha**:
 
 ```powershell
-python interfaz_cliente.py
+python C:\Users\msoto\Desktop\bigdata_evaluacion2\servidor_prueba.py
 ```
 
-Cargar el CSV, seleccionar columnas, mantener IP `127.0.0.1` y puerto `5000`,
-pulsar **Probar conexión** y luego **Enviar datos**. La prueba usa ping/pong y
-no envía filas. El envío transmite todas las filas con las columnas seleccionadas
-al pulsar el botón; cambiar casillas durante la operación no cambia ese envío.
-Se bloquean nuevas cargas y operaciones de red simultáneas. Sin columnas, el
-botón de envío queda deshabilitado y también existe validación antes de conectar.
+Abra `python interfaz_cliente.py`, cargue el CSV, seleccione columnas y use
+`127.0.0.1:12345`. Para otro equipo use la IP y escucha correspondientes.
+Pulse **Enviar datos**. Se conservan lectura, validaciones, vista previa,
+selección y progreso; las operaciones de red siguen en segundo plano.
 
-La barra muestra el progreso y separa **enviados** (registros de lotes cuyo
-`sendall` terminó) de **confirmados** (conteo final validado por el servidor).
-El progreso del 100 % enviado todavía puede estar esperando confirmación.
-Ante desconexión o confirmación incorrecta no se declara éxito: confirmados queda
-en cero, que significa ausencia de confirmación válida, no necesariamente que el
-servidor no haya recibido datos. Un lote parcialmente enviado al fallar no se
-incluye en el conteo local. No hay reintentos automáticos ni reanudación.
+**Probar conexión** solo abre y cierra TCP, sin enviar bytes. No valida el
+protocolo ni transmite un ping o un dataset vacío. El servidor oficial puede
+registrarla como transferencia incompleta; su dataset anterior se conserva.
 
-El servidor acepta conexiones sucesivas de forma secuencial hasta **Ctrl+C** y
-solo cuenta y valida registros; no los persiste. Para otro destino local:
+### Protocolo
+
+Una transferencia es un solo arreglo JSON de objetos UTF-8 con sufijo `<EOF>`:
+
+```text
+[{"fecha":"2015-01-01","caudal_m3_s":0.644}]<EOF>
+```
+
+El cliente serializa fila por fila, agrupando lotes de aproximadamente 64 KiB,
+sin construir el JSON completo en memoria. Un registro individual puede superar
+ese tamaño. Las claves son las columnas seleccionadas; nulos y valores no
+finitos se representan como `null`. `<EOF>` dentro de valores se conserva.
+No se usan JSON Lines ni mensajes de inicio, fin, ping o pong.
+
+Tras enviar el sufijo se ejecuta `shutdown(socket.SHUT_WR)` y se mantiene la
+lectura abierta. El servidor espera ese cierre antes de responder y cerrar:
+
+```json
+{"ok":true,"filas":569250}
+```
+
+Solo hay éxito si `ok` es exactamente `true` y `filas` es un entero igual
+al total enviado. Rechazos (`ok: false`, con `detalle`), respuestas vacías,
+malformadas, conteos distintos, desconexiones o timeout producen un error.
+Se recompone la respuesta hasta el cierre TCP, con un límite de 64 KiB.
+El timeout del cliente es 120 segundos por operación bloqueante. El servidor
+oficial tiene sus propios límites (512 MiB, 60 segundos sin avance y
+600 segundos totales por defecto).
+
+La barra distingue enviados (lotes cuyo `sendall` terminó) de confirmados
+(conteo final validado). El 100 % enviado puede seguir esperando respuesta.
+Un lote parcialmente enviado no cuenta; confirmados en cero significa ausencia
+de confirmación válida. No hay reintentos ni reanudación automáticos.
+El protocolo no incorpora autenticación ni cifrado.
+
+El receptor local usa el mismo formato, sin persistencia ni dashboard:
 
 ```powershell
-python servidor_prueba.py --host 127.0.0.1 --puerto 5001
+python servidor_prueba.py --host 127.0.0.1 --puerto 12345
 ```
 
-### Protocolo provisional v1
-
-Se centraliza en `transmision.py` para adaptarlo al futuro contrato del Grupo 4.
-**El protocolo es provisional y debe coordinarse con el Grupo 4 antes de integrar
-ambos sistemas**: nombres y orden de campos, representación de valores, mensajes
-de control, versión, límites y confirmaciones forman parte de ese acuerdo.
-Cada conexión admite una prueba ping/pong o una transmisión. Todos los mensajes
-son objetos JSON estrictos en UTF-8 seguidos por `\n` (JSON Lines). Cada línea
-admite como máximo **1 MiB**, incluido el salto. El receptor usa lectura de líneas
-con búfer y límite, por lo que admite fragmentación y agrupación TCP, incluso
-cuando un carácter UTF-8 queda dividido entre paquetes. No se usa `recv` como
-si cada llamada fuera un mensaje completo.
-
-Ejemplo con dos columnas y una fila:
-
-```jsonl
-{"tipo":"inicio","version":1,"columnas":["fecha","caudal_m3_s"],"registros":1}
-{"tipo":"registro","datos":["2015-01-01",0.644]}
-{"tipo":"fin","registros":1}
-```
-
-El servidor devuelve:
-
-```jsonl
-{"tipo":"confirmacion","registros":1}
-```
-
-`datos` es una lista de valores en el orden de `columnas`. El campo exterior
-`tipo` distingue controles y registros sin confundirse con nombres o valores del
-dataset. Nulos y números no finitos se representan como `null`; el CSV CAMELS-CL
-aporta cadenas y números. El servidor exige cabecera válida, versión compatible,
-cantidad de valores correcta y coincidencia entre conteo inicial, final y recibido.
-Ante un mensaje inválido intenta responder `{"tipo":"error","mensaje":"..."}`
-y cierra la conexión sin confirmar. Cerrar sin `fin` es una transmisión incompleta.
-
-La prueba de conexión envía `{"tipo":"ping","version":1}` y espera
-`{"tipo":"pong","version":1}`. Los sockets tienen timeout de **30 segundos por
-operación bloqueante**, no por transferencia completa. Las filas se serializan
-progresivamente y se agrupan en lotes de aproximadamente **64 KiB**; una línea
-individual puede superar el lote, hasta el límite de 1 MiB. No se construye una
-cadena JSON del dataset completo. Esta herramienta está destinada a pruebas
-locales; el protocolo actual no incorpora autenticación, cifrado ni persistencia.
-
-### Comprobaciones reproducibles
+### Pruebas
 
 ```powershell
-python -B -m unittest test_transmision -v
+python -B -m unittest discover -v
 ```
 
-La primera prueba transmite **50 filas** y después **569.250 filas** del CSV real,
-verificando en cada caso enviados = recibidos = confirmados. Se usan servidores
-TCP locales con puertos efímeros; no es necesario abrir el servidor manualmente.
-También se comprueban fragmentación byte a byte, UTF-8, selección de columnas,
-nulos, ping/pong, confirmación incorrecta, desconexión, timeout, conteos inválidos,
-límites de línea y selección vacía. Se verifica el hash del CSV antes y después.
-Los datos permanecen locales; todos los archivos `*.csv` están excluidos mediante `.gitignore`.
+Se verifican lotes, nulos, Unicode, marcas dentro de valores, respuestas
+fragmentadas e inválidas, timeout, selección vacía, prueba TCP sin bytes,
+receptor local y acciones de GUI con mocks sin abrir ventanas.
+La integración carga el servidor de referencia del Grupo 4 en memoria y
+prueba su adaptador `atender` mediante puertos efímeros. Si el archivo de
+referencia no existe, esa prueba se omite. No se modifican sus archivos.
 
-### Prueba local con cinco columnas
+El 17 de octubre de 2026 pasaron siete pruebas, incluyendo 50 filas y las
+**569.250 filas del CSV enviadas, recibidas y confirmadas** por el Grupo 4.
+Se comprobó el hash del dataset antes y después. La aceptación visual del
+dashboard Tkinter queda para una verificación manual.
 
-El 17 de octubre de 2026 se verificó una transmisión TCP local completa con las
-columnas `fecha`, `estacion_id`, `estacion_nombre`, `zona_latitudinal` y
-`caudal_m3_s`, en ese orden, contra `servidor_prueba.procesar_conexion` mediante
-un puerto local efímero. Se utilizó el cliente real `transmision.enviar_datos`.
-
-| Columnas | Registros enviados | Registros recibidos | Registros confirmados |
-| ---: | ---: | ---: | ---: |
-| 5 | 569.250 | 569.250 | 569.250 |
-
-Para repetirla desde la interfaz, inicie el servidor, cargue el dataset, marque
-solo esas cinco columnas y pulse **Enviar datos**. La vista previa muestra hasta
-100 filas, pero la transmisión incluye las 569.250. La suite automatizada anterior
-prueba las ocho columnas; esta comprobación adicional verifica cinco columnas.
-
-Tkinter forma parte de la distribución habitual de Python para Windows y no se
-agregan dependencias. Si Python informa que falta `tkinter`, habilite el componente
-Tcl/Tk en el instalador de Python. La validación por terminal sigue disponible
-mediante el comando siguiente.
+Tkinter requiere Tcl/Tk en la instalación de Python. No se agregan dependencias.
+Los CSV permanecen excluidos de Git.
 
 ## Ejecución
 
